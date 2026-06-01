@@ -18,7 +18,7 @@ Usage:
         --seq 220923_yogi_body_hands_03596_Boat_Pose_or_Paripurna_Navasana_-a \
         --cam YOGI_Cam_02 \
         --n_rows 10 \
-        --n_frames 5
+        --n_frames 100
 """
 
 import argparse
