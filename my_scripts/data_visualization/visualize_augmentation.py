@@ -18,7 +18,7 @@ Usage:
         --seq 220923_yogi_body_hands_03596_Boat_Pose_or_Paripurna_Navasana_-a \
         --cam YOGI_Cam_02 \
         --n_rows 10 \
-        --n_frames 100
+        --n_frames 10
 """
 
 import argparse
@@ -700,9 +700,8 @@ def main():
     # Build cam_params dicts for all cameras (for triangulation)
     cp_dict = {f"YOGI_Cam_{int(k.split('_')[1]):02d}": read_cam_params_dict(v)
                for k, v in all_cam_raw.items()}
-    # Restrict to the subset of cameras used for triangulation
-    _MOYO_CAMS = ["YOGI_Cam_02", "YOGI_Cam_06", "YOGI_Cam_07", "YOGI_Cam_08"]
-    all_cam_names = [c for c in sorted(cp_dict.keys()) if c in _MOYO_CAMS]
+    # Use ALL available cameras for triangulation
+    all_cam_names = sorted(cp_dict.keys())
     cp_list = [cp_dict[c] for c in all_cam_names]
 
     # ── Load MMPose for ALL cameras (for triangulation) ───────

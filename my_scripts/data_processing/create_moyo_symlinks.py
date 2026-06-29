@@ -1,12 +1,13 @@
 """
 Create a symlink tree at ~/data/mocap/data/moyo/ that maps MOYO's native
 layout into the structure expected by mocap_mainloader, AND writes converted
-camera parameter JSON files (format mismatch prevents symlinking those).
+camera parameter JSON files and SMPL-X NPZ files (format mismatch prevents symlinking those).
 
   mocap/data/moyo/{dtype}/{sequence}/
     videos/{camera}/result.mp4         → moyo/data/mmpose/{model}/{session}/{dtype}/{sequence}/{camera}/result.mp4
     mmpose/{model}/{camera}/result.json → moyo/data/mmpose/{model}/{session}/{dtype}/{sequence}/{camera}/result.json
     mhr/result.npz                      → moyo/data/mhr/{dtype}/{sequence}.npz
+    smplx/result.npz                    (written — converted from YOGI_2 SMPL-X .npz)
     camera_parameters/{camera}/result.json  (written, not symlinked — format conversion required)
 
 Camera params conversion:
@@ -14,6 +15,13 @@ Camera params conversion:
     flat dict per camera: focal (px, full-res), position (mm), princpt, rotation (3x3)
   Target: fit3d format with extrinsics.R / extrinsics.T (metres) / intrinsics_wo_distortion.f,c
     intrinsics scaled by 0.5 to match stored video/mmpose resolution
+
+SMPL-X conversion:
+  Source: ~/data/moyo/data/YOGI_2_latest_smplx_neutral/{dtype}/{seq}_stageii.npz
+    Keys: root_orient, pose_body, pose_hand, pose_jaw, pose_eye, trans, betas (axis-angle)
+  Target: fit3d-compatible NPZ at mocap/data/moyo/{dtype}/{seq}/smplx/result.npz
+    Keys: global_orient, body_pose, left_hand_pose, right_hand_pose, jaw_pose,
+          leye_pose, reye_pose, transl, betas (rotation matrices)
 
 Only sequences with an MHR .npz are linked (others lack ground truth).
 
@@ -27,9 +35,11 @@ import os
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 MOYO_DATA    = Path.home() / "data/moyo/data"
 MOCAP_MOYO   = Path.home() / "data/mocap/data/moyo"
+YOGI2_DATA   = MOYO_DATA / "YOGI_2_latest_smplx_neutral"
 MMPOSE_MODEL = "rtmw-dw-l-m_simcc-cocktail14_270e-256x192-20231122"
 INTR_SCALE   = 0.5   # MOYO videos/mmpose annotations are at 0.5x calibration resolution
 
@@ -71,6 +81,72 @@ def moyo_cam_to_fit3d(cam: dict) -> dict:
         "extrinsics": {"R": R.tolist(), "T": T.tolist()},
         "intrinsics_wo_distortion": {"f": [focal, focal], "c": [cx, cy]},
     }
+
+
+def aa_to_rotmat(aa_flat: np.ndarray) -> np.ndarray:
+    """Convert flat axis-angle vectors (N, 3) to rotation matrices (N, 3, 3)."""
+    return Rotation.from_rotvec(aa_flat).as_matrix().astype(np.float32)
+
+
+def convert_yogi2_to_smplx(src_npz: Path, dst_npz: Path, dry_run: bool, force: bool) -> None:
+    """Convert YOGI_2 SMPL-X .npz (axis-angle) → fit3d-compatible .npz (rotation matrices).
+
+    YOGI_2 keys (axis-angle):
+        root_orient (T, 3)      pose_body (T, 63)     pose_hand (T, 90)
+        pose_jaw    (T, 3)      pose_eye  (T, 6)      trans     (T, 3)
+        betas       (300,)      shared across all frames
+
+    Output keys (rotation matrices):
+        global_orient (T, 1, 3, 3)    body_pose       (T, 21, 3, 3)
+        left_hand_pose (T, 15, 3, 3)  right_hand_pose (T, 15, 3, 3)
+        jaw_pose (T, 1, 3, 3)         leye_pose (T, 1, 3, 3)   reye_pose (T, 1, 3, 3)
+        transl (T, 3)                 betas (T, 10)
+    """
+    if dst_npz.exists() and not force:
+        return
+    if dry_run:
+        print(f"  [dry smplx] {dst_npz}")
+        return
+
+    data = np.load(src_npz, allow_pickle=True)
+    T = data["trans"].shape[0]
+
+    # betas: (300,) shared vector → tile to (T, 10)
+    betas = np.tile(data["betas"][:10].astype(np.float32), (T, 1))
+
+    # axis-angle → rotation matrices
+    # Each source array is (T, J*3) — reshape to (T*J, 3), convert, then reshape back
+    global_orient = aa_to_rotmat(data["root_orient"]).reshape(T, 1, 3, 3)            # (T, 3) → (T, 1, 3, 3)
+
+    body_pose = data["pose_body"].reshape(T, 21, 3)                                   # (T, 63) → (T, 21, 3)
+    body_pose = aa_to_rotmat(body_pose.reshape(-1, 3)).reshape(T, 21, 3, 3)          # → (T, 21, 3, 3)
+
+    # hands: (T, 90) = left (45) + right (45)
+    pose_hand = data["pose_hand"].reshape(T, 30, 3)                                   # (T, 90) → (T, 30, 3)
+    left_hand_pose  = aa_to_rotmat(pose_hand[:, :15].reshape(-1, 3)).reshape(T, 15, 3, 3)
+    right_hand_pose = aa_to_rotmat(pose_hand[:, 15:].reshape(-1, 3)).reshape(T, 15, 3, 3)
+
+    jaw_pose = aa_to_rotmat(data["pose_jaw"]).reshape(T, 1, 3, 3)                    # (T, 3) → (T, 1, 3, 3)
+
+    # eyes: (T, 6) = left (3) + right (3)
+    pose_eye = data["pose_eye"].reshape(T, 2, 3)                                      # (T, 6) → (T, 2, 3)
+    leye_pose = aa_to_rotmat(pose_eye[:, 0]).reshape(T, 1, 3, 3)                     # (T, 3) → (T, 1, 3, 3)
+    reye_pose = aa_to_rotmat(pose_eye[:, 1]).reshape(T, 1, 3, 3)
+
+    out = {
+        "transl":          data["trans"].astype(np.float32),
+        "global_orient":   global_orient,
+        "body_pose":       body_pose,
+        "betas":           betas,
+        "left_hand_pose":  left_hand_pose,
+        "right_hand_pose": right_hand_pose,
+        "jaw_pose":        jaw_pose,
+        "leye_pose":       leye_pose,
+        "reye_pose":       reye_pose,
+    }
+
+    dst_npz.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(dst_npz, **out)
 
 
 def main(dry_run: bool, force: bool) -> None:
@@ -141,6 +217,25 @@ def main(dry_run: bool, force: bool) -> None:
 
     mode = "DRY RUN" if dry_run else "DONE"
     print(f"\n[{mode}] {total_seqs} sequences, {total_links} symlinks, {total_cam_files} camera param files")
+
+    # ── SMPL-X conversion from YOGI_2 ────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    print(f"SMPL-X conversion (YOGI_2 → fit3d format)")
+    print(f"{'─'*60}")
+    total_smplx = 0
+    for dtype in ("train", "val"):
+        yogi2_dtype = YOGI2_DATA / dtype
+        if not yogi2_dtype.exists():
+            print(f"[warn] YOGI_2 {dtype} dir not found: {yogi2_dtype}")
+            continue
+        for src_npz in sorted(yogi2_dtype.glob("*_stageii.npz")):
+            seq = src_npz.stem.replace("_stageii", "")  # strip _stageii suffix
+            dst_npz = MOCAP_MOYO / dtype / seq / "smplx" / "result.npz"
+            convert_yogi2_to_smplx(src_npz, dst_npz, dry_run, force)
+            total_smplx += 1
+
+    mode = "DRY RUN" if dry_run else "DONE"
+    print(f"\n[{mode}] {total_smplx} SMPL-X conversions")
 
 
 if __name__ == "__main__":
